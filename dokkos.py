@@ -2067,6 +2067,27 @@ def _wifi_base_iface():
     return None
 
 
+def _restore_network():
+    """Bring back NetworkManager / wpa_supplicant that `airmon-ng check kill` stopped."""
+    ok = False
+    for svc in ("NetworkManager", "wpa_supplicant"):
+        if shutil.which("systemctl"):
+            try:
+                _, _, rc = run_capture(["systemctl", "restart", svc], 20)
+                if rc == 0:
+                    ok = True
+                    continue
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if shutil.which("service"):          # non-systemd fallback
+            try:
+                run_capture(["service", svc.lower(), "restart"], 20)
+                ok = True
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return ok
+
+
 @app.route("/api/monitor_mode", methods=["POST"])
 def api_monitor_mode():
     """Toggle Wi-Fi monitor mode via airmon-ng (passive listening; needs root)."""
@@ -2107,13 +2128,15 @@ def api_monitor_mode():
     target = iface or WIFI_MON or _iface_in_monitor()
     if not target:
         WIFI_MON = None
+        _restore_network()
         return jsonify(ok=True, enabled=False, monitor=None)
     try:
         run_capture(["airmon-ng", "stop", target], 40)
     except (OSError, subprocess.SubprocessError) as e:
         return jsonify(error=f"airmon-ng stop failed: {e}"), 500
     WIFI_MON = None
-    return jsonify(ok=True, enabled=False, monitor=None)
+    restored = _restore_network()
+    return jsonify(ok=True, enabled=False, monitor=None, network_restored=restored)
 
 
 @app.route("/api/monitor_mode/status", methods=["GET"])
@@ -2742,7 +2765,7 @@ PAGE = r"""<!doctype html>
       <button class="um" data-um="pro">PRO</button>
       <button class="um on" data-um="r6">R6</button>
     </div>
-    <div class="mark" id="mark" title="command palette (Ctrl/Cmd+K)" style="cursor:pointer"><svg class="maskico" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 12 L11 5 L14 12" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M23 12 L21 5 L18 12" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M7 12 Q16 10 25 12 L23 21 Q16 27 9 21 Z" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M11 16 l3 1 -3 1.5 Z" fill="var(--em)"/><path d="M21 16 l-3 1 3 1.5 Z" fill="var(--em)"/><path d="M13 21 q3 1.5 6 0" fill="none" stroke="var(--em)" stroke-width="1.4"/></svg> Dokk<span>OS</span><small id="ver">recon v4.7</small></div>
+    <div class="mark" id="mark" title="command palette (Ctrl/Cmd+K)" style="cursor:pointer"><svg class="maskico" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 12 L11 5 L14 12" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M23 12 L21 5 L18 12" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M7 12 Q16 10 25 12 L23 21 Q16 27 9 21 Z" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M11 16 l3 1 -3 1.5 Z" fill="var(--em)"/><path d="M21 16 l-3 1 3 1.5 Z" fill="var(--em)"/><path d="M13 21 q3 1.5 6 0" fill="none" stroke="var(--em)" stroke-width="1.4"/></svg> Dokk<span>OS</span><small id="ver">recon v4.8</small></div>
     <div class="prog" id="prog"></div>
   </div>
 
