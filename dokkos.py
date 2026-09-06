@@ -2026,6 +2026,34 @@ def api_launch():
     return jsonify(ok=True, launched=tool["label"])
 
 
+def _iface_in_monitor():
+    """Any interface currently in monitor mode, via iw dev or iwconfig."""
+    m = detect_monitor_iface()
+    if m:
+        return m
+    if shutil.which("iwconfig"):
+        try:
+            out, _, _ = run_capture(["iwconfig"], 5)
+            cur = None
+            for line in out.splitlines():
+                if line and not line[0].isspace():
+                    cur = line.split()[0]
+                if "Mode:Monitor" in line and cur:
+                    return cur
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def _await_monitor(tries=6, delay=0.5):
+    for _ in range(tries):
+        m = _iface_in_monitor()
+        if m:
+            return m
+        time.sleep(delay)
+    return None
+
+
 def _wifi_base_iface():
     """First managed wireless interface (for switching into monitor mode)."""
     if shutil.which("iw"):
@@ -2061,18 +2089,22 @@ def api_monitor_mode():
             return jsonify(error="airmon-ng timed out"), 504
         except (OSError, subprocess.SubprocessError) as e:
             return jsonify(error=f"airmon-ng failed: {e}"), 500
-        mon = detect_monitor_iface()
-        if not mon:
-            m = re.search(r"monitor mode.*?(?:enabled|vif enabled).*?\b(\w+mon\w*|\w+)\)?\s*$",
-                          out, re.I | re.M)
-            mon = m.group(1) if m else None
-        if not mon:
-            return jsonify(error="couldn't confirm monitor mode — check the adapter/chipset",
-                           raw=out[-400:]), 500
-        WIFI_MON = mon
-        return jsonify(ok=True, enabled=True, monitor=mon)
+        mon = _await_monitor()                      # poll iw/iwconfig for a couple seconds
+        if mon:
+            WIFI_MON = mon
+            return jsonify(ok=True, enabled=True, monitor=mon)
+        # Not confirmed by iw/iwconfig — but if airmon-ng reported success, trust it.
+        low = out.lower()
+        m = re.search(r"\b(\w*mon\d*)\b", out)
+        cand = m.group(1) if m else None
+        if "monitor mode" in low and ("enabled" in low or "already" in low):
+            WIFI_MON = cand or (base + "mon") or base
+            return jsonify(ok=True, enabled=True, monitor=WIFI_MON,
+                           note="engaged, but iw/iwconfig didn't confirm — verify the interface")
+        return jsonify(error="couldn't start monitor mode — check the adapter/chipset, and run the server as root",
+                       raw=out[-400:]), 500
     # disable
-    target = iface or WIFI_MON or detect_monitor_iface()
+    target = iface or WIFI_MON or _iface_in_monitor()
     if not target:
         WIFI_MON = None
         return jsonify(ok=True, enabled=False, monitor=None)
@@ -2086,7 +2118,7 @@ def api_monitor_mode():
 
 @app.route("/api/monitor_mode/status", methods=["GET"])
 def api_monitor_mode_status():
-    mon = WIFI_MON or detect_monitor_iface()
+    mon = WIFI_MON or _iface_in_monitor()
     return jsonify(enabled=bool(mon), monitor=mon)
 
 
@@ -2710,7 +2742,7 @@ PAGE = r"""<!doctype html>
       <button class="um" data-um="pro">PRO</button>
       <button class="um on" data-um="r6">R6</button>
     </div>
-    <div class="mark" id="mark" title="command palette (Ctrl/Cmd+K)" style="cursor:pointer"><svg class="maskico" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 12 L11 5 L14 12" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M23 12 L21 5 L18 12" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M7 12 Q16 10 25 12 L23 21 Q16 27 9 21 Z" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M11 16 l3 1 -3 1.5 Z" fill="var(--em)"/><path d="M21 16 l-3 1 3 1.5 Z" fill="var(--em)"/><path d="M13 21 q3 1.5 6 0" fill="none" stroke="var(--em)" stroke-width="1.4"/></svg> Dokk<span>OS</span><small id="ver">recon v4.5</small></div>
+    <div class="mark" id="mark" title="command palette (Ctrl/Cmd+K)" style="cursor:pointer"><svg class="maskico" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 12 L11 5 L14 12" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M23 12 L21 5 L18 12" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M7 12 Q16 10 25 12 L23 21 Q16 27 9 21 Z" fill="none" stroke="var(--em)" stroke-width="2" stroke-linejoin="round"/><path d="M11 16 l3 1 -3 1.5 Z" fill="var(--em)"/><path d="M21 16 l-3 1 3 1.5 Z" fill="var(--em)"/><path d="M13 21 q3 1.5 6 0" fill="none" stroke="var(--em)" stroke-width="1.4"/></svg> Dokk<span>OS</span><small id="ver">recon v4.7</small></div>
     <div class="prog" id="prog"></div>
   </div>
 
@@ -2773,7 +2805,7 @@ PAGE = r"""<!doctype html>
 
   <div class="bot">
     <div class="tools" id="tools"></div>
-    <button class="stealth on" id="stealth" title="randomise our MAC on scans (nmap --spoof-mac 0)">STEALTH ON</button>
+    <button class="stealth" id="stealth" title="randomise our MAC on scans (nmap --spoof-mac 0)">STEALTH OFF</button>
     <button class="gear" id="historybtn" aria-label="detection history" title="detection history / timeline"></button>
     <button class="gear" id="monitorbtn" aria-label="unattended watch" title="start unattended watch"></button>
     <button class="gear" id="reportbtn" aria-label="export report" title="export markdown report"></button>
@@ -2948,7 +2980,7 @@ const out=$("#out"), prog=$("#prog"), toast=$("#toast"),
       callscreen=$("#callscreen"), bigcall=$("#bigcall"),
       tcard=$("#tcard"), tname=$("#tname"), tsub=$("#tsub"), taddr=$("#taddr"), tphase=$("#tphase");
 let hosts=[], selected=null, mode="net", profile="deep", running=false, ctrl=null, scopes=[];
-let lastWifi={aps:[],clients:[]}, scanHost=null, stealth=true, gen=0, wlanMon=null, called=false;
+let lastWifi={aps:[],clients:[]}, scanHost=null, stealth=false, gen=0, wlanMon=null, called=false;
 let uiMode="r6", scanPhase=null, scanPct=0, defProfile="deep";
 let session={};   // addr -> captured scan findings (for the map + export)
 let detailView=false, huntActive=false, huntCtrl=null;
@@ -3168,7 +3200,7 @@ function setPref(k,v){ try{ localStorage.setItem(PK+k,v); }catch(e){} }
 function reflectStealth(){ const b=$("#stealth"); b.classList.toggle("on",stealth); b.textContent=stealth?"STEALTH ON":"STEALTH OFF"; }
 function loadPrefs(){
   uiMode   = getPref("ui","r6");
-  stealth  = getPref("stealth","on")==="on";
+  stealth  = getPref("stealth","off")==="on";
   defProfile = getPref("prof","deep");
   profile  = mode==="net" ? defProfile : defaultProf();
   document.querySelectorAll("[data-um]").forEach(b=>b.classList.toggle("on",b.dataset.um===uiMode));
